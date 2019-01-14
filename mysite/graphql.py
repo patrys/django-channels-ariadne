@@ -1,34 +1,32 @@
+import asyncio
 import json
-from typing import Any, Callable, List, Optional, Union
+from functools import partial
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Union, cast
 
 from ariadne.constants import (
     CONTENT_TYPE_JSON,
     CONTENT_TYPE_TEXT_HTML,
     CONTENT_TYPE_TEXT_PLAIN,
     DATA_TYPE_JSON,
-    HTTP_STATUS_200_OK,
-    HTTP_STATUS_400_BAD_REQUEST,
     PLAYGROUND_HTML,
 )
 from ariadne.exceptions import HttpBadRequestError, HttpError, HttpMethodNotAllowedError
-from ariadne.executable_schema import make_executable_schema
 from ariadne.types import Bindable
 from channels.generic.http import AsyncHttpConsumer
-from graphql import GraphQLError, format_error, graphql
+from channels.generic.websocket import AsyncJsonWebsocketConsumer
+from graphql import GraphQLError, GraphQLSchema, format_error, graphql, parse, subscribe
 from graphql.execution import ExecutionResult
 import traceback
 
 
-class GraphQLConsumer(AsyncHttpConsumer):
-    def __init__(
-        self,
-        type_defs: Union[str, List[str]],
-        resolvers: Union[Bindable, List[Bindable], None] = None,
-        *args,
-        **kwargs
-    ):
-        self.schema = make_executable_schema(type_defs, resolvers)
+class GraphQLHTTPConsumer(AsyncHttpConsumer):
+    def __init__(self, schema: GraphQLSchema, *args, **kwargs):
+        self.schema = schema
         return super().__init__(*args, **kwargs)
+
+    @classmethod
+    def for_schema(cls, schema: GraphQLSchema):
+        return partial(cls, schema)
 
     async def handle(self, body):
         try:
@@ -55,7 +53,6 @@ class GraphQLConsumer(AsyncHttpConsumer):
         )
 
     async def handle_request(self, body: bytes) -> None:
-        print("REQUEST", self.scope)
         if self.scope["method"] == "GET":
             await self.handle_get()
         if self.scope["method"] == "POST":
@@ -144,3 +141,117 @@ class GraphQLConsumer(AsyncHttpConsumer):
             json.dumps(response).encode("utf-8"),
             headers=[(b"Content-Type", CONTENT_TYPE_JSON.encode("utf-8"))],
         )
+
+
+class GraphQLWebsocketConsumer(AsyncJsonWebsocketConsumer):
+    def __init__(self, schema: GraphQLSchema, *args, **kwargs):
+        self.schema = schema
+        self.subscriptions: Dict[str, AsyncGenerator] = {}
+        return super().__init__(*args, **kwargs)
+
+    @classmethod
+    def for_schema(cls, schema: GraphQLSchema):
+        return partial(cls, schema)
+
+    async def connect(self):
+        await self.accept("graphql-ws")
+
+    async def receive_json(self, message: dict):
+        operation_id = cast(str, message.get("id"))
+        message_type = cast(str, message.get("type"))
+        payload = cast(dict, message.get("payload"))
+
+        if message_type == "connection_init":
+            return await self.subscription_init(operation_id, payload)
+        if message_type == "connection_terminate":
+            return await self.subscription_terminate(operation_id)
+        if message_type == "start":
+            await self.validate_payload(operation_id, payload)
+            return await self.subscription_start(operation_id, payload)
+        if message_type == "stop":
+            return await self.subscription_stop(operation_id)
+        return await self.send_error(operation_id, "Unknown message type")
+
+    async def validate_payload(self, operation_id: str, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return await self.send_error(operation_id, "Payload must be an object")
+        query = payload.get("query")
+        if not query or not isinstance(query, str):
+            return await self.send_error(operation_id, "The query must be a string.")
+        variables = payload.get("variables")
+        if variables is not None and not isinstance(variables, dict):
+            return await self.send_error(
+                operation_id, "Query variables must be a null or an object."
+            )
+        operation_name = payload.get("operationName")
+        if operation_name is not None and not isinstance(operation_name, str):
+            return await self.send_error(
+                operation_id, '"%s" is not a valid operation name.' % operation_name
+            )
+
+    async def send_message(
+        self, operation_id: str, message_type: str, payload: dict = None
+    ) -> None:
+        message: Dict[str, Any] = {"type": message_type}
+        if operation_id is not None:
+            message["id"] = operation_id
+        if payload is not None:
+            message["payload"] = payload
+        return await self.send_json(message)
+
+    async def send_result(self, operation_id: str, result: ExecutionResult) -> None:
+        payload = {}
+        if result.data:
+            payload["data"] = result.data
+        if result.errors:
+            payload["errors"] = [format_error(e) for e in result.errors]
+        await self.send_message(operation_id, "data", payload)
+
+    async def send_error(self, operation_id: str, message: str) -> None:
+        payload = {"message": message}
+        await self.send_message(operation_id, "error", payload)
+
+    async def subscription_init(self, operation_id: str, payload: dict) -> None:
+        await self.send_message(operation_id, "ack")
+
+    async def subscription_start(self, operation_id: str, payload: dict) -> None:
+        results = await subscribe(
+            self.schema,
+            parse(payload["query"]),
+            root_value=self.get_query_root(payload),
+            context_value=self.get_query_context(payload),
+            variable_values=payload.get("variables"),
+            operation_name=payload.get("operationName"),
+        )
+        if isinstance(results, ExecutionResult):
+            await self.send_result(operation_id, results)
+            await self.send_message(operation_id, "complete")
+        else:
+            asyncio.ensure_future(self.observe(operation_id, results))
+
+    async def subscription_stop(self, operation_id: str) -> None:
+        if operation_id in self.subscriptions:
+            await self.subscriptions[operation_id].aclose()
+            del self.subscriptions[operation_id]
+
+    def get_query_root(
+        self, request_data: dict  # pylint: disable=unused-argument
+    ) -> Any:
+        """Override this method in inheriting class to create query root."""
+        return None
+
+    def get_query_context(
+        self, request_data: dict  # pylint: disable=unused-argument
+    ) -> Any:
+        """Override this method in inheriting class to create query context."""
+        return {"scope": self.scope}
+
+    async def observe(self, operation_id: str, results: AsyncGenerator) -> None:
+        self.subscriptions[operation_id] = results
+        async for result in results:
+            await self.send_result(operation_id, result)
+        await self.send_message(operation_id, "complete", None)
+
+    async def disconnect(self, code: Any) -> None:
+        for operation_id in self.subscriptions:
+            self.subscription_stop(operation_id)
