@@ -1,6 +1,6 @@
 import asyncio
 
-from ariadne import gql, ResolverMap, Subscription
+from ariadne import gql, ResolverMap
 from ariadne.executable_schema import make_executable_schema
 from channels.routing import ProtocolTypeRouter, URLRouter
 from django.conf.urls import url
@@ -8,6 +8,7 @@ from graphql.pyutils import EventEmitter, EventEmitterAsyncIterator
 from graphql.subscription import subscribe
 
 from .graphql import GraphQLHTTPConsumer, GraphQLWebsocketConsumer
+from .subscription import SubscriptionAwareResolverMap
 
 SCHEMA = gql(
     """
@@ -27,7 +28,7 @@ type Subscription {
 mutation = ResolverMap("Mutation")
 pubsub = EventEmitter()
 query = ResolverMap("Query")
-messages = Subscription("messages")
+subscription = SubscriptionAwareResolverMap("Subscription")
 
 
 @query.field("hello")
@@ -42,17 +43,18 @@ async def send_message(root, info, message):
     return True
 
 
-@messages.subscriber
+@subscription.subscription("messages")
 def subscribe_messages(root, info):
     return EventEmitterAsyncIterator(pubsub, "message")
 
 
-@messages.resolver
+@subscription.field("messages")
 def push_message(message, info):
     return message
 
 
-schema = make_executable_schema(SCHEMA, [messages, mutation, query])
+schema = make_executable_schema(SCHEMA, [mutation, query, subscription])
+
 
 application = ProtocolTypeRouter(
     {
