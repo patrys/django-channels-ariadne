@@ -10,6 +10,7 @@ django = "*"
 ariadne = "*"
 channels = "*"
 channels-redis = "*"
+gino = "*"
 
 [requires]
 python_version = "3.7"
